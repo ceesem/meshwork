@@ -28,7 +28,7 @@ with open('test_requirements.txt', 'r') as f:
     test_required = f.read().splitlines()
 
 setup(
-    name='nglui',
+    name='meshwork',
     version=find_version('src', 'meshwork', '__init__.py'),
     description='Decorated meshes for connectomics',
     long_description=open('README.md').read(),

@@ -1,5 +1,5 @@
 import meshwork
 
 
-def test_nothing():
+def test_import():
     pass
