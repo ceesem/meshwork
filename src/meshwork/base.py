@@ -5,6 +5,16 @@ import numpy as np
 from .utils import InputError, unique_column_name, DEFAULT_VOXEL_RESOLUTION
 
 
+class MaskedMeshMemory(object):
+    def __init__(self, mesh):
+        self.node_mask = mesh.node_mask
+        self.map_indices_to_unmasked = mesh.map_indices_to_unmasked
+        self.map_boolean_to_unmasked = mesh.map_boolean_to_unmasked
+        self.filter_unmasked_boolean = mesh.filter_unmasked_boolean
+        self.filter_unmasked_indices = mesh.filter_unmasked_indices
+        self.filter_unmasked_indices_padded = mesh.filter_unmasked_indices_padded
+
+
 class LinkedAnnotationHolder(object):
     def __init__(self,
                  mesh=None,
@@ -13,7 +23,8 @@ class LinkedAnnotationHolder(object):
         if voxel_resolution is None:
             voxel_resolution = DEFAULT_VOXEL_RESOLUTION
         self._voxel_resolution = np.array(voxel_resolution).reshape((1, 3))
-        self._mesh = mesh
+        self._link_mesh = mesh
+        self._filter_mesh = None
         self._data_tables = {}
 
     def __getitem__(self, key):
@@ -57,7 +68,7 @@ class LinkedAnnotationHolder(object):
 
         self._data_tables[name] = MeshLinkedAnnotation(name,
                                                        data,
-                                                       self._mesh,
+                                                       self._link_mesh,
                                                        point_column=point_column,
                                                        link_to_mesh=link,
                                                        max_distance=max_distance,
@@ -66,21 +77,30 @@ class LinkedAnnotationHolder(object):
                                                        )
 
     def filter_annotations(self, new_mesh):
+        self._filter_mesh = MaskedMeshMemory(new_mesh)
         for tn in self.table_names:
-            self._data_tables[tn]._filter_data(new_mesh)
+            self._data_tables[tn]._filter_data(self._filter_mesh)
 
     def reset_filters(self):
+        self._filter_mesh = None
         for tn in self.table_names:
             self._data_tables[tn]._reset_data()
 
     def remove_annotations(self, name):
         self._data_tables.pop(name, None)
 
-    def link_new_mesh(self, new_mesh):
-        self._mesh = new_mesh
+    def link_annotation(self, name):
+        self._data_tables[name]._link_to_mesh(self._link_mesh)
+        if self._filter_mesh is not None:
+            self._data_tables[name]._filter_data(self._filter_mesh)
+
+    def update_linked_mesh(self, new_mesh):
+        self._link_mesh = new_mesh
 
         for name in self.table_names:
             table = self._data_tables[name]
+            if table._linked is False:
+                continue
 
             if table._index_column_base in table._original_columns:
                 index_column = table._index_column_base
@@ -92,18 +112,15 @@ class LinkedAnnotationHolder(object):
             else:
                 point_column = None
 
-            if table._valid_column in table._original_columns:
-                valid_column = table._valid_column
-            else:
-                valid_column = None
-
             self._data_tables[name] = MeshLinkedAnnotation(name,
-                                                           table.original_data,
-                                                           self._mesh,
+                                                           table.data_original,
+                                                           self._link_mesh,
                                                            point_column=point_column,
-                                                           max_distance=max_distance,
+                                                           max_distance=table._max_distance,
                                                            index_column=index_column,
                                                            voxel_resolution=self.voxel_resolution)
+            if self._filter_mesh is not None:
+                self._data_tables[name]._filter_data(self._filter_mesh)
 
 
 class MeshLinkedAnnotation(object):
@@ -119,7 +136,7 @@ class MeshLinkedAnnotation(object):
                  ):
 
         self._name = name
-        self._data = data
+        self._data = data.reset_index()
         self._original_columns = data.columns
         self._max_distance = max_distance
 
@@ -257,9 +274,13 @@ class MeshLinkedAnnotation(object):
             self._data[self._mask_column] = True
             self._data[self._index_column_filt] = self._mesh_index_base
 
-    def link_to_mesh(self, mesh):
+    def _link_to_mesh(self, mesh):
         self._linked = True
         self._attach_points(mesh)
+
+    @property
+    def linked(self):
+        return self._linked
 
 
 def _compress_mesh_data(mesh, cname='lz4'):
@@ -284,9 +305,21 @@ class Meshwork(object):
 
         if voxel_resolution is None:
             voxel_resolution = DEFAULT_VOXEL_RESOLUTION
-        self._linked_data = LinkedAnnotationHolder(
-            mesh=self._mesh, voxel_resolution=voxel_resolution)
+
+        self._mesh_mask = np.full(self._mesh.n_vertices, True)
 
     @property
     def seg_id(self):
         return self._seg_id
+
+    @property
+    def mesh(self):
+        return self._mesh
+
+    @property
+    def mesh_mask(self):
+        return self._mesh_mask
+
+    def apply_mask(self, mask):
+        self._mesh = self._mesh.apply_mask(mask)
+        self._mesh_mask = self.mesh.node_mask
