@@ -1,75 +1,36 @@
+import blosc
 from meshparty import trimesh_io, skeleton_io, skeleton
 import pandas as pd
 import numpy as np
 from .utils import InputError, unique_column_name, DEFAULT_VOXEL_RESOLUTION
 
 
-class MeshLinkedData(object):
+class LinkedAnnotationHolder(object):
     def __init__(self,
-                 name,
-                 data,
-                 mesh,
-                 point_column=None,
-                 max_distance=np.inf,
-                 index_column=None,
-                 valid_column=None,
+                 mesh=None,
                  voxel_resolution=None,
                  ):
-        self._name = name
-        self._data = data
-        self._original_columns = data.columns
-        if point_column is None and index_column is None:
-            raise InputError(
-                "Either a point column or an index column must be specified")
-
-        self._point_column = point_column
-        if index_column is None:
-            index_column = unique_column_name(point_column, 'mesh_index', data)
-        self._index_column = index_column
-
-        if valid_column is None:
-            valid_column = unique_column_name(index_column, 'valid', data)
-        self._valid_column = valid_column
-
         if voxel_resolution is None:
             voxel_resolution = DEFAULT_VOXEL_RESOLUTION
-        if mesh.voxel_scaling is not None:
-            voxel_resolution = voxel_resolution * mesh.voxel_scaling
+        self._voxel_resolution = np.array(voxel_resolution).reshape((1, 3))
+        self._mesh = mesh
+        self._data_tables = {}
 
-        self._voxel_resolution = voxel_resolution
-        self._attach_points(mesh, max_distance, voxel_resolution)
+    def __getitem__(self, key):
+        return self._data_tables[key]
 
-    @property
-    def index_column(self):
-        return self._index_column
+    def __repr__(self):
+        return f'Data tables: {self.table_names}'
 
-    @property
-    def point_column(self):
-        return self._point_column
+    def __len__(self):
+        return len(self._data_tables)
 
-    @property
-    def valid_column(self):
-        return self._valid_column
+    def items(self):
+        return self._data_tables.items()
 
     @property
-    def data(self):
-        return self._data[self._original_columns]
-
-    @property
-    def data_all(self):
-        return self._data
-
-    @property
-    def name(self):
-        return self._name
-
-    @property
-    def mesh_indices(self):
-        return self._data[self.index_column]
-
-    @property
-    def valid_indices(self):
-        return self._data[self.valid_column]
+    def table_names(self):
+        return list(self._data_tables.keys())
 
     @property
     def voxel_resolution(self):
@@ -78,39 +39,253 @@ class MeshLinkedData(object):
     @voxel_resolution.setter
     def voxel_resolution(self, new_res):
         self._voxel_resolution = np.array(new_res).reshape((1, 3))
-        print(self._voxel_resolution)
+        for tn in self.table_names:
+            self._data_tables[tn].voxel_resolution = self._voxel_resolution
+
+    def add_annotations(self,
+                        name,
+                        data,
+                        link=True,
+                        point_column=None,
+                        max_distance=np.inf,
+                        index_column=None,
+                        overwrite=False,
+                        ):
+        if name in self.table_names and overwrite is False:
+            raise ValueError(
+                'Table name already taken. Overwrite or choose a different name.')
+
+        self._data_tables[name] = MeshLinkedAnnotation(name,
+                                                       data,
+                                                       self._mesh,
+                                                       point_column=point_column,
+                                                       link_to_mesh=link,
+                                                       max_distance=max_distance,
+                                                       index_column=index_column,
+                                                       voxel_resolution=self.voxel_resolution,
+                                                       )
+
+    def filter_annotations(self, new_mesh):
+        for tn in self.table_names:
+            self._data_tables[tn]._filter_data(new_mesh)
+
+    def reset_filters(self):
+        for tn in self.table_names:
+            self._data_tables[tn]._reset_data()
+
+    def remove_annotations(self, name):
+        self._data_tables.pop(name, None)
+
+    def link_new_mesh(self, new_mesh):
+        self._mesh = new_mesh
+
+        for name in self.table_names:
+            table = self._data_tables[name]
+
+            if table._index_column_base in table._original_columns:
+                index_column = table._index_column_base
+            else:
+                index_column = None
+
+            if table._point_column in table._original_columns:
+                point_column = table._point_column
+            else:
+                point_column = None
+
+            if table._valid_column in table._original_columns:
+                valid_column = table._valid_column
+            else:
+                valid_column = None
+
+            self._data_tables[name] = MeshLinkedAnnotation(name,
+                                                           table.original_data,
+                                                           self._mesh,
+                                                           point_column=point_column,
+                                                           max_distance=max_distance,
+                                                           index_column=index_column,
+                                                           voxel_resolution=self.voxel_resolution)
+
+
+class MeshLinkedAnnotation(object):
+    def __init__(self,
+                 name,
+                 data,
+                 mesh=None,
+                 link_to_mesh=True,
+                 point_column=None,
+                 max_distance=np.inf,
+                 index_column=None,
+                 voxel_resolution=None,
+                 ):
+
+        self._name = name
+        self._data = data
+        self._original_columns = data.columns
+        self._max_distance = max_distance
+
+        self._point_column = point_column
+        if index_column is None:
+            index_column = unique_column_name(
+                None, 'mesh_index_base', data)
+        self._index_column_base = index_column
+        self._index_column_filt = unique_column_name(
+            None, 'mesh_index', data)
+
+        self._orig_col_plus_index = list(
+            self._original_columns) + [self._index_column_filt]
+        # Initalize to -1 so the column exists
+        self._data[self._index_column_base] = -1
+        self._data[self._index_column_filt] = -1
+
+        valid_column = unique_column_name(index_column, 'valid', data)
+        self._data[valid_column] = True
+        self._valid_column = valid_column
+
+        self._mask_column = unique_column_name(
+            index_column, 'in_mask', data)
+        # Initalize in_mask to True before any subsequent masking
+        self._data[self._mask_column] = True
+
+        if voxel_resolution is None:
+            voxel_resolution = DEFAULT_VOXEL_RESOLUTION
+        if mesh.voxel_scaling is not None:
+            voxel_resolution = voxel_resolution * mesh.voxel_scaling
+
+        self._voxel_resolution = np.array(voxel_resolution).reshape((1, 3))
+
+        self._linked = link_to_mesh
+        if self._linked and mesh is not None:
+            self._attach_points(mesh)
+
+    def __repr__(self):
+        return self.df.__repr__()
+
+    def _repr_html_(self):
+        return self.df._repr_html_()
+
+    def __getitem__(self, key):
+        return self.df.__getitem__(key)
+
+    def __len__(self):
+        return len(self.df)
+
+    @property
+    def name(self):
+        return self._name
+
+    @property
+    def point_column(self):
+        return self._point_column
+
+    @property
+    def index_column(self):
+        return self._index_column_filt
+
+    @property
+    def _is_valid(self):
+        return self._data[self._valid_column]
+
+    @property
+    def _in_mask(self):
+        return self._data[self._mask_column]
+
+    @property
+    def _is_included(self):
+        return np.logical_and(self._is_valid, self._in_mask)
+
+    @property
+    def df(self):
+        if self._linked:
+            return self._data[self._orig_col_plus_index][self._is_included]
+        else:
+            return self._data[self._original_columns][self._is_included]
+
+    @property
+    def voxel_resolution(self):
+        return self._voxel_resolution
+
+    @voxel_resolution.setter
+    def voxel_resolution(self, new_res):
+        self._voxel_resolution = np.array(new_res).reshape((1, 3))
 
     @property
     def voxels(self):
         if self.point_column is None:
-            return None
+            return np.zeros((0, 3))
         else:
-            return np.vstack(self.data[self.point_column].values)
+            return np.vstack(self.df[self.point_column].values)
 
     @property
     def points(self):
         if self.point_column is None:
-            return None
+            return np.zeros((0, 3))
         else:
             return self.voxels * self.voxel_resolution
 
-    def _attach_points(self, mesh, max_distance, voxel_resolution):
-        dist, minds_basic = mesh.kdtree.query(self.points)
-        minds = mesh.map_indices_to_unmasked(minds_basic)
-        self._data[self.index_column] = minds
+    @property
+    def mesh_index(self):
+        return self._data[self._index_column_filt][self._is_included].values
 
-        if self.valid_column not in self.data.columns:
-            self._data[self.valid_column] = dist < max_distance
-        else:
-            self._data[self.valid_column] = np.logical_or(
-                dist < max_distance, self._data[self.valid_column])
+    @property
+    def _mesh_index_base(self):
+        return self._data[self._index_column_base].values
+
+    @property
+    def data_original(self):
+        return self._data[self._original_columns]
+
+    def _attach_points(self, mesh):
+        dist, minds_filt = mesh.kdtree.query(self.points)
+        self._data[self._index_column_filt] = minds_filt
+
+        minds_base = mesh.map_indices_to_unmasked(minds_filt)
+        self._data[self._index_column_base] = minds_base
+
+        self._data[self._valid_column] = np.logical_and(
+            dist < self._max_distance, self._is_valid)
+
+    def _filter_data(self, new_mesh):
+        """Get the subset of data points that are associated with the mesh
+        """
+        if self._linked:
+            self._data[self._mask_column] = new_mesh.node_mask[self._mesh_index_base]
+            self._data[self._index_column_filt] = new_mesh.filter_unmasked_indices_padded(
+                self._mesh_index_base)
+
+    def _reset_data(self):
+        if self._linked:
+            self._data[self._mask_column] = True
+            self._data[self._index_column_filt] = self._mesh_index_base
+
+    def link_to_mesh(self, mesh):
+        self._linked = True
+        self._attach_points(mesh)
+
+
+def _compress_mesh_data(mesh, cname='lz4'):
+    zvs = blosc.compress(mesh.vertices.tostring(), typesize=8, cname=cname)
+    zfs = blosc.compress(mesh.faces.tostring(), typesize=8, cname=cname)
+    zes = blosc.compress(mesh.link_edges.tostring(), typesize=8, cname=cname)
+    return zvs, zfs, zes
+
+
+def _decompress_mesh_data(zvs, zfs, zes):
+    vs = np.frombuffer(blosc.decompress(zvs)).reshape(-1, 3)
+    fs = np.frombuffer(blosc.decompress(zfs)).reshape(-1, 3)
+    es = np.frombuffer(blosc.decompress(zes)).reshape(-1, 2)
+    return trimesh_io.Mesh(vs, fs, link_edges=es)
 
 
 class Meshwork(object):
-    def __init__(self, seg_id=None, mesh=None, skeleton=None, annotations=None):
+    def __init__(self, mesh=None, seg_id=None, voxel_resolution=None):
         self._seg_id = seg_id
-        self._original_mesh = mesh
-        self._skeleton = skeleton
+        self._mesh = mesh
+        self._original_mesh_data = _compress_mesh_data(mesh)
+
+        if voxel_resolution is None:
+            voxel_resolution = DEFAULT_VOXEL_RESOLUTION
+        self._linked_data = LinkedAnnotationHolder(
+            mesh=self._mesh, voxel_resolution=voxel_resolution)
 
     @property
     def seg_id(self):

@@ -7,7 +7,10 @@ class InputError(Exception):
 
 
 def unique_column_name(base_name, suffix, df):
-    col_name = f"{base_name}_{suffix}"
+    if base_name is not None:
+        col_name = f"{base_name}_{suffix}"
+    else:
+        col_name = suffix
     if col_name in df.columns:
         ii = 0
         while True:
