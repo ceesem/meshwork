@@ -2,29 +2,32 @@ import blosc
 from meshparty import trimesh_io, skeleton_io, skeleton
 import pandas as pd
 import numpy as np
-from .utils import InputError, unique_column_name, DEFAULT_VOXEL_RESOLUTION
+from .utils import InputError, unique_column_name, DEFAULT_VOXEL_RESOLUTION, MaskedMeshMemory, _compress_mesh_data, _decompress_mesh_data
 
 
-class MaskedMeshMemory(object):
-    def __init__(self, mesh):
-        self.node_mask = mesh.node_mask
-        self.map_indices_to_unmasked = mesh.map_indices_to_unmasked
-        self.map_boolean_to_unmasked = mesh.map_boolean_to_unmasked
-        self.filter_unmasked_boolean = mesh.filter_unmasked_boolean
-        self.filter_unmasked_indices = mesh.filter_unmasked_indices
-        self.filter_unmasked_indices_padded = mesh.filter_unmasked_indices_padded
-
-
-class LinkedAnnotationHolder(object):
+class AnchoredAnnotationManager(object):
     def __init__(self,
-                 mesh=None,
+                 anchor_mesh=None,
+                 filter_mesh=None,
                  voxel_resolution=None,
                  ):
+        """Collection of dataframes anchored to a common mesh and filter.
+
+        Parameters
+        ----------
+        mesh : trimesh_io.Mesh, optional
+            Mesh to use to link points to vertex indices, by default None
+        voxel_resolution : array-like, optional
+            3-element array of the resolution of voxels in the point columns of the dataframes, by default None
+        """
         if voxel_resolution is None:
             voxel_resolution = DEFAULT_VOXEL_RESOLUTION
         self._voxel_resolution = np.array(voxel_resolution).reshape((1, 3))
-        self._link_mesh = mesh
-        self._filter_mesh = None
+        if anchor_mesh is None:
+            self._anchor_mesh = None
+        else:
+            self._anchor_mesh = MaskedMeshMemory(anchor_mesh)
+        self._filter_mesh = filter_mesh,
         self._data_tables = {}
 
     def __getitem__(self, key):
@@ -41,10 +44,12 @@ class LinkedAnnotationHolder(object):
 
     @property
     def table_names(self):
+        "List of data table names"
         return list(self._data_tables.keys())
 
     @property
     def voxel_resolution(self):
+        "Resolution in nm of the data in the point column"
         return self._voxel_resolution
 
     @voxel_resolution.setter
@@ -53,53 +58,14 @@ class LinkedAnnotationHolder(object):
         for tn in self.table_names:
             self._data_tables[tn].voxel_resolution = self._voxel_resolution
 
-    def add_annotations(self,
-                        name,
-                        data,
-                        link=True,
-                        point_column=None,
-                        max_distance=np.inf,
-                        index_column=None,
-                        overwrite=False,
-                        ):
-        if name in self.table_names and overwrite is False:
-            raise ValueError(
-                'Table name already taken. Overwrite or choose a different name.')
+    def update_anchor_mesh(self, new_mesh):
+        "Change or add the mesh to use for proximity-linking"
 
-        self._data_tables[name] = MeshLinkedAnnotation(name,
-                                                       data,
-                                                       self._link_mesh,
-                                                       point_column=point_column,
-                                                       link_to_mesh=link,
-                                                       max_distance=max_distance,
-                                                       index_column=index_column,
-                                                       voxel_resolution=self.voxel_resolution,
-                                                       )
-
-    def filter_annotations(self, new_mesh):
-        self._filter_mesh = MaskedMeshMemory(new_mesh)
-        for tn in self.table_names:
-            self._data_tables[tn]._filter_data(self._filter_mesh)
-
-    def reset_filters(self):
-        self._filter_mesh = None
-        for tn in self.table_names:
-            self._data_tables[tn]._reset_data()
-
-    def remove_annotations(self, name):
-        self._data_tables.pop(name, None)
-
-    def link_annotation(self, name):
-        self._data_tables[name]._link_to_mesh(self._link_mesh)
-        if self._filter_mesh is not None:
-            self._data_tables[name]._filter_data(self._filter_mesh)
-
-    def update_linked_mesh(self, new_mesh):
-        self._link_mesh = new_mesh
+        self._anchor_mesh = new_mesh
 
         for name in self.table_names:
             table = self._data_tables[name]
-            if table._linked is False:
+            if table.anchored is False:
                 continue
 
             if table._index_column_base in table._original_columns:
@@ -112,23 +78,71 @@ class LinkedAnnotationHolder(object):
             else:
                 point_column = None
 
-            self._data_tables[name] = MeshLinkedAnnotation(name,
-                                                           table.data_original,
-                                                           self._link_mesh,
-                                                           point_column=point_column,
-                                                           max_distance=table._max_distance,
-                                                           index_column=index_column,
-                                                           voxel_resolution=self.voxel_resolution)
+            self._data_tables[name] = AnchoredAnnotation(name,
+                                                         table.data_original,
+                                                         self._anchor_mesh,
+                                                         point_column=point_column,
+                                                         max_distance=table._max_distance,
+                                                         index_column=index_column,
+                                                         voxel_resolution=self.voxel_resolution)
             if self._filter_mesh is not None:
                 self._data_tables[name]._filter_data(self._filter_mesh)
 
+    def add_annotations(self,
+                        name,
+                        data,
+                        anchored=True,
+                        point_column=None,
+                        max_distance=np.inf,
+                        index_column=None,
+                        overwrite=False,
+                        ):
+        "Add a dataframe to the manager"
 
-class MeshLinkedAnnotation(object):
+        if name in self.table_names and overwrite is False:
+            raise ValueError(
+                'Table name already taken. Overwrite or choose a different name.')
+
+        self._data_tables[name] = AnchoredAnnotation(name,
+                                                     data,
+                                                     self._anchor_mesh,
+                                                     point_column=point_column,
+                                                     anchor_to_mesh=anchored,
+                                                     max_distance=max_distance,
+                                                     index_column=index_column,
+                                                     voxel_resolution=self.voxel_resolution,
+                                                     )
+
+    def remove_annotations(self, name):
+        "Remove a data table from the manager"
+        if name in self._data_tables:
+            del self._data_tables[name]
+
+    def anchor_annotations(self, name):
+        "If an annotation is not anchored, link it to the current anchor mesh and apply the current filters"
+        self._data_tables[name]._anchor_to_mesh(self._anchor_mesh)
+        if self._filter_mesh is not None:
+            self._data_tables[name]._filter_data(self._filter_mesh)
+
+    def filter_annotations(self, new_mesh):
+        "Use a masked mesh to filter all anchored annotations"
+        self._filter_mesh = MaskedMeshMemory(new_mesh)
+        for tn in self.table_names:
+            self._data_tables[tn]._filter_data(self._filter_mesh)
+
+    def remove_filter(self):
+        "Remove filters from the annotations"
+        self._filter_mesh = None
+        for tn in self.table_names:
+            self._data_tables[tn]._reset_filter()
+
+
+class AnchoredAnnotation(object):
     def __init__(self,
                  name,
                  data,
                  mesh=None,
-                 link_to_mesh=True,
+                 anchor_to_mesh=True,
                  point_column=None,
                  max_distance=np.inf,
                  index_column=None,
@@ -170,9 +184,9 @@ class MeshLinkedAnnotation(object):
 
         self._voxel_resolution = np.array(voxel_resolution).reshape((1, 3))
 
-        self._linked = link_to_mesh
-        if self._linked and mesh is not None:
-            self._attach_points(mesh)
+        self._anchored = anchor_to_mesh
+        if self._anchored and mesh is not None:
+            self._anchor_points(mesh)
 
     def __repr__(self):
         return self.df.__repr__()
@@ -212,7 +226,7 @@ class MeshLinkedAnnotation(object):
 
     @property
     def df(self):
-        if self._linked:
+        if self.anchored:
             return self._data[self._orig_col_plus_index][self._is_included]
         else:
             return self._data[self._original_columns][self._is_included]
@@ -227,7 +241,7 @@ class MeshLinkedAnnotation(object):
 
     @property
     def voxels(self):
-        if self.point_column is None:
+        if self.point_column is None or len(self.df) == 0:
             return np.zeros((0, 3))
         else:
             return np.vstack(self.df[self.point_column].values)
@@ -241,7 +255,10 @@ class MeshLinkedAnnotation(object):
 
     @property
     def mesh_index(self):
-        return self._data[self._index_column_filt][self._is_included].values
+        if self.anchored:
+            return self._data[self._index_column_filt][self._is_included].values
+        else:
+            return None
 
     @property
     def _mesh_index_base(self):
@@ -251,50 +268,37 @@ class MeshLinkedAnnotation(object):
     def data_original(self):
         return self._data[self._original_columns]
 
-    def _attach_points(self, mesh):
+    def _anchor_points(self, mesh):
         dist, minds_filt = mesh.kdtree.query(self.points)
         self._data[self._index_column_filt] = minds_filt
 
         minds_base = mesh.map_indices_to_unmasked(minds_filt)
         self._data[self._index_column_base] = minds_base
 
-        self._data[self._valid_column] = np.logical_and(
-            dist < self._max_distance, self._is_valid)
+        self._data[self._valid_column] = dist < self._max_distance
 
-    def _filter_data(self, new_mesh):
+    def _filter_data(self, filter_mesh):
         """Get the subset of data points that are associated with the mesh
         """
-        if self._linked:
-            self._data[self._mask_column] = new_mesh.node_mask[self._mesh_index_base]
-            self._data[self._index_column_filt] = new_mesh.filter_unmasked_indices_padded(
+        if self._anchored:
+            self._data[self._mask_column] = filter_mesh.node_mask[self._mesh_index_base]
+            self._data[self._index_column_filt] = filter_mesh.filter_unmasked_indices_padded(
                 self._mesh_index_base)
 
-    def _reset_data(self):
-        if self._linked:
+    def _reset_filter(self):
+        if self._anchored:
             self._data[self._mask_column] = True
             self._data[self._index_column_filt] = self._mesh_index_base
 
-    def _link_to_mesh(self, mesh):
-        self._linked = True
-        self._attach_points(mesh)
+    def _anchor_to_mesh(self, anchor_mesh):
+        self._anchored = True
+        self._reset_filter()
+        self._data[self._valid_column] = True
+        self._anchor_points(anchor_mesh)
 
     @property
-    def linked(self):
-        return self._linked
-
-
-def _compress_mesh_data(mesh, cname='lz4'):
-    zvs = blosc.compress(mesh.vertices.tostring(), typesize=8, cname=cname)
-    zfs = blosc.compress(mesh.faces.tostring(), typesize=8, cname=cname)
-    zes = blosc.compress(mesh.link_edges.tostring(), typesize=8, cname=cname)
-    return zvs, zfs, zes
-
-
-def _decompress_mesh_data(zvs, zfs, zes):
-    vs = np.frombuffer(blosc.decompress(zvs)).reshape(-1, 3)
-    fs = np.frombuffer(blosc.decompress(zfs)).reshape(-1, 3)
-    es = np.frombuffer(blosc.decompress(zes)).reshape(-1, 2)
-    return trimesh_io.Mesh(vs, fs, link_edges=es)
+    def anchored(self):
+        return self._anchored
 
 
 class Meshwork(object):
@@ -305,6 +309,8 @@ class Meshwork(object):
 
         if voxel_resolution is None:
             voxel_resolution = DEFAULT_VOXEL_RESOLUTION
+        self._annotations = AnchoredAnnotationManager(
+            self._mesh, voxel_resolution=voxel_resolution)
 
         self._mesh_mask = np.full(self._mesh.n_vertices, True)
 
@@ -322,4 +328,11 @@ class Meshwork(object):
 
     def apply_mask(self, mask):
         self._mesh = self._mesh.apply_mask(mask)
+
         self._mesh_mask = self.mesh.node_mask
+        self._annotations.filter_annotations(self._mesh)
+
+    def reset_mesh(self):
+        self._mesh = _decompress_mesh_data(*self._original_mesh_data)
+        self._mesh_mask = np.full(self._mesh.n_vertices, True)
+        self._annotations.reset_filters()
