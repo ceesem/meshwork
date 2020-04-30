@@ -1,5 +1,5 @@
 import blosc
-from meshparty import trimesh_io, skeleton_io, skeleton
+from meshparty.trimesh_vtk import mesh_actor, point_cloud_actor
 import pandas as pd
 import numpy as np
 from .utils import InputError, unique_column_name, DEFAULT_VOXEL_RESOLUTION, MaskedMeshMemory, _compress_mesh_data, _decompress_mesh_data
@@ -115,14 +115,20 @@ class AnchoredAnnotationManager(object):
 
     def remove_annotations(self, name):
         "Remove a data table from the manager"
-        if name in self._data_tables:
-            del self._data_tables[name]
+        if isinstance(name, str):
+            name = [name]
+        for n in name:
+            if n in self._data_tables:
+                del self._data_tables[n]
 
     def anchor_annotations(self, name):
         "If an annotation is not anchored, link it to the current anchor mesh and apply the current filters"
-        self._data_tables[name]._anchor_to_mesh(self._anchor_mesh)
-        if self._filter_mesh is not None:
-            self._data_tables[name]._filter_data(self._filter_mesh)
+        if isinstance(name, str):
+            name = [name]
+        for n in name:
+            self._data_tables[n]._anchor_to_mesh(self._anchor_mesh)
+            if self._filter_mesh is not None:
+                self._data_tables[n]._filter_data(self._filter_mesh)
 
     def filter_annotations(self, new_mesh):
         "Use a masked mesh to filter all anchored annotations"
@@ -285,6 +291,15 @@ class AnchoredAnnotation(object):
             self._data[self._index_column_filt] = filter_mesh.filter_unmasked_indices_padded(
                 self._mesh_index_base)
 
+    def _filter_query(self, node_mask):
+        """Returns the data contained with a given filter without changing any indexing.
+        """
+        if self._anchored:
+            keep_rows = node_mask[self._data[self._mesh_index_base]]
+            return keep_rows[self._in_mask]
+        else:
+            return np.full(len(self.df), True)
+
     def _reset_filter(self):
         if self._anchored:
             self._data[self._mask_column] = True
@@ -302,17 +317,17 @@ class AnchoredAnnotation(object):
 
 
 class Meshwork(object):
-    def __init__(self, mesh=None, seg_id=None, voxel_resolution=None):
+    def __init__(self, mesh, seg_id=None, voxel_resolution=None):
         self._seg_id = seg_id
         self._mesh = mesh
-        self._original_mesh_data = _compress_mesh_data(mesh)
 
         if voxel_resolution is None:
             voxel_resolution = DEFAULT_VOXEL_RESOLUTION
-        self._annotations = AnchoredAnnotationManager(
+        self._anno = AnchoredAnnotationManager(
             self._mesh, voxel_resolution=voxel_resolution)
 
-        self._mesh_mask = np.full(self._mesh.n_vertices, True)
+        self._mesh_mask = mesh.node_mask
+        self._original_mesh_data = _compress_mesh_data(mesh)
 
     @property
     def seg_id(self):
@@ -328,11 +343,41 @@ class Meshwork(object):
 
     def apply_mask(self, mask):
         self._mesh = self._mesh.apply_mask(mask)
-
         self._mesh_mask = self.mesh.node_mask
-        self._annotations.filter_annotations(self._mesh)
+        self._anno.filter_annotations(self._mesh)
 
     def reset_mesh(self):
         self._mesh = _decompress_mesh_data(*self._original_mesh_data)
         self._mesh_mask = np.full(self._mesh.n_vertices, True)
-        self._annotations.reset_filters()
+        self._anno.remove_filter()
+
+    @property
+    def anno(self):
+        return self._anno
+
+    def add_annotations(self,
+                        name,
+                        data,
+                        anchored=True,
+                        point_column=None,
+                        max_distance=np.inf,
+                        index_column=None,
+                        overwrite=False,
+                        ):
+        self._anno.add_annotations(
+            name, data, anchored, point_column, max_distance, index_column, overwrite)
+
+    def remove_annotations(self, name):
+        self._anno.remove_annotations(name)
+
+    def update_anchors(self):
+        self._anno.update_anchor_mesh(self.mesh)
+
+    def anchor_annotations(self, name):
+        self._anno.anchor_annotations(name)
+
+    def mesh_actor(self, **kwargs):
+        return mesh_actor(self.mesh, **kwargs)
+
+    def anno_point_actor(self, anno_name, **kwargs):
+        return point_cloud_actor(self.anno[anno_name].points, **kwargs)

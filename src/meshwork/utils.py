@@ -1,5 +1,7 @@
 import blosc
 import numpy as np
+from meshparty.trimesh_io import Mesh
+
 DEFAULT_VOXEL_RESOLUTION = [4, 4, 40]
 
 
@@ -25,17 +27,23 @@ def unique_column_name(base_name, suffix, df):
 
 
 def _compress_mesh_data(mesh, cname='lz4'):
+    if mesh.voxel_scaling is not None:
+        vxsc = mesh.voxel_scaling
+    else:
+        vxsc = None
+    mesh.voxel_scaling = None
     zvs = blosc.compress(mesh.vertices.tostring(), typesize=8, cname=cname)
     zfs = blosc.compress(mesh.faces.tostring(), typesize=8, cname=cname)
     zes = blosc.compress(mesh.link_edges.tostring(), typesize=8, cname=cname)
-    return zvs, zfs, zes
+    mesh.voxel_scaling = vxsc
+    return zvs, zfs, zes, vxsc
 
 
-def _decompress_mesh_data(zvs, zfs, zes):
-    vs = np.frombuffer(blosc.decompress(zvs)).reshape(-1, 3)
-    fs = np.frombuffer(blosc.decompress(zfs)).reshape(-1, 3)
-    es = np.frombuffer(blosc.decompress(zes)).reshape(-1, 2)
-    return trimesh_io.Mesh(vs, fs, link_edges=es)
+def _decompress_mesh_data(zvs, zfs, zes, vxsc):
+    vs = np.frombuffer(blosc.decompress(zvs), dtype=np.float).reshape(-1, 3)
+    fs = np.frombuffer(blosc.decompress(zfs), dtype=np.int).reshape(-1, 3)
+    es = np.frombuffer(blosc.decompress(zes), dtype=np.int).reshape(-1, 2)
+    return Mesh(vs, fs, link_edges=es, voxel_scaling=vxsc)
 
 
 class MaskedMeshMemory(object):
