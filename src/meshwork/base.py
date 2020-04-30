@@ -291,14 +291,47 @@ class AnchoredAnnotation(object):
             self._data[self._index_column_filt] = filter_mesh.filter_unmasked_indices_padded(
                 self._mesh_index_base)
 
+    def _filter_query_response(self, row_filter):
+        _parent = self
+
+        class _FilterQueryResponse(object):
+            def __init__(self, row_filter):
+                self._row_filter = row_filter
+
+            @property
+            def row_filter(self):
+                return self._row_filter
+
+            @property
+            def voxels(self):
+                return _parent.voxels[self.row_filter]
+
+            @property
+            def points(self):
+                return _parent.points[self.row_filter]
+
+            @property
+            def df(self):
+                return _parent.df[self.row_filter]
+
+            @property
+            def count(self):
+                return np.sum(row_filter)
+
+        return _FilterQueryResponse(row_filter)
+
     def _filter_query(self, node_mask):
         """Returns the data contained with a given filter without changing any indexing.
         """
         if self._anchored:
-            keep_rows = node_mask[self._data[self._mesh_index_base]]
+            keep_rows = node_mask[self._mesh_index_base]
             return keep_rows[self._in_mask]
         else:
             return np.full(len(self.df), True)
+
+    def filter_query(self, node_mask):
+        row_filter = self._filter_query(node_mask)
+        return self._filter_query_response(row_filter)
 
     def _reset_filter(self):
         if self._anchored:
@@ -333,6 +366,8 @@ class Meshwork(object):
     def seg_id(self):
         return self._seg_id
 
+    # Mesh functions
+
     @property
     def mesh(self):
         return self._mesh
@@ -347,9 +382,11 @@ class Meshwork(object):
         self._anno.filter_annotations(self._mesh)
 
     def reset_mesh(self):
+        "Reset mesh to original state"
         self._mesh = _decompress_mesh_data(*self._original_mesh_data)
         self._mesh_mask = np.full(self._mesh.n_vertices, True)
         self._anno.remove_filter()
+    # Anno functions
 
     @property
     def anno(self):
