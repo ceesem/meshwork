@@ -1,5 +1,6 @@
 import blosc
-from meshparty.trimesh_vtk import mesh_actor, point_cloud_actor
+from meshparty import trimesh_vtk
+from meshparty.trimesh_io import Mesh
 import pandas as pd
 import numpy as np
 from .utils import InputError, unique_column_name, DEFAULT_VOXEL_RESOLUTION, MaskedMeshMemory, _compress_mesh_data, _decompress_mesh_data
@@ -28,16 +29,21 @@ class AnchoredAnnotationManager(object):
         else:
             self._anchor_mesh = MaskedMeshMemory(anchor_mesh)
         self._filter_mesh = filter_mesh,
-        self._data_tables = {}
+        self._data_tables = dict()
+
+    def __len__(self):
+        return len(self._data_tables)
 
     def __getitem__(self, key):
         return self._data_tables[key]
 
+    def __delitem__(self, key):
+        if key in self._data_tables:
+            del self._data_tables[key]
+            del self.__dict__[key]
+
     def __repr__(self):
         return f'Data tables: {self.table_names}'
-
-    def __len__(self):
-        return len(self._data_tables)
 
     def items(self):
         return self._data_tables.items()
@@ -88,6 +94,13 @@ class AnchoredAnnotationManager(object):
             if self._filter_mesh is not None:
                 self._data_tables[name]._filter_data(self._filter_mesh)
 
+    def _add_attribute(self, key):
+        if key in dir(self):
+            if not isinstance(self.key, AnchoredAnnotation):
+                return
+        else:
+            self.__dict__[key] = self._data_tables[key]
+
     def add_annotations(self,
                         name,
                         data,
@@ -112,14 +125,14 @@ class AnchoredAnnotationManager(object):
                                                      index_column=index_column,
                                                      voxel_resolution=self.voxel_resolution,
                                                      )
+        self._add_attribute(name)
 
     def remove_annotations(self, name):
         "Remove a data table from the manager"
         if isinstance(name, str):
             name = [name]
         for n in name:
-            if n in self._data_tables:
-                del self._data_tables[n]
+            del self[n]
 
     def anchor_annotations(self, name):
         "If an annotation is not anchored, link it to the current anchor mesh and apply the current filters"
@@ -323,6 +336,8 @@ class AnchoredAnnotation(object):
     def _filter_query(self, node_mask):
         """Returns the data contained with a given filter without changing any indexing.
         """
+        if len(node_mask) == self.mesh.n_vertices:
+            node_mask = self.mesh.map_boolean_to_unmasked(node_mask)
         if self._anchored:
             keep_rows = node_mask[self._mesh_index_base]
             return keep_rows[self._in_mask]
@@ -350,9 +365,10 @@ class AnchoredAnnotation(object):
 
 
 class Meshwork(object):
-    def __init__(self, mesh, seg_id=None, voxel_resolution=None):
+    def __init__(self, mesh, skeleton=None, seg_id=None, voxel_resolution=None):
         self._seg_id = seg_id
         self._mesh = mesh
+        self._skeleton = skeleton
 
         if voxel_resolution is None:
             voxel_resolution = DEFAULT_VOXEL_RESOLUTION
@@ -360,13 +376,15 @@ class Meshwork(object):
             self._mesh, voxel_resolution=voxel_resolution)
 
         self._mesh_mask = mesh.node_mask
-        self._original_mesh_data = _compress_mesh_data(mesh)
+        self._original_mesh_data = None
 
     @property
     def seg_id(self):
         return self._seg_id
 
-    # Mesh functions
+    ##################
+    # Mesh functions #
+    ##################
 
     @property
     def mesh(self):
@@ -377,16 +395,27 @@ class Meshwork(object):
         return self._mesh_mask
 
     def apply_mask(self, mask):
+        self._original_mesh_data = _compress_mesh_data(self.mesh)
         self._mesh = self._mesh.apply_mask(mask)
         self._mesh_mask = self.mesh.node_mask
-        self._anno.filter_annotations(self._mesh)
+        self._anno.filter_annotations(self.mesh)
 
     def reset_mesh(self):
         "Reset mesh to original state"
-        self._mesh = _decompress_mesh_data(*self._original_mesh_data)
-        self._mesh_mask = np.full(self._mesh.n_vertices, True)
-        self._anno.remove_filter()
-    # Anno functions
+        if self._original_mesh_data is not None:
+            self._anno.remove_filter()
+
+            vs, fs, es, nm, vxsc = _decompress_mesh_data(
+                *self._original_mesh_data)
+            self._mesh = Mesh(vs, fs, link_edges=es,
+                              node_mask=nm, voxel_scaling=vxsc)
+
+            self.apply_mask(nm)
+            self._original_mesh_data = None
+
+    ##################
+    # Anno functions #
+    ##################
 
     @property
     def anno(self):
@@ -413,8 +442,70 @@ class Meshwork(object):
     def anchor_annotations(self, name):
         self._anno.anchor_annotations(name)
 
+    ######################
+    # Skeleton functions #
+    ######################
+
+    @property
+    def skeleton(self):
+        return self._skeleton
+
+    def skeletonize_mesh(self,
+                         soma_pt=None,
+                         soma_thresh_distance=7500,
+                         invalidation_distance=12000,
+                         compute_radius=True,
+                         overwrite=False):
+        from meshparty.skeletonize import skeletonize_mesh
+        if self._skeleton is None or overwrite is True:
+            self._skeleton = skeletonize_mesh(self.mesh,
+                                              soma_pt=soma_pt,
+                                              soma_radius=soma_thresh_distance,
+                                              collapse_soma=True,
+                                              invalidation_d=invalidation_distance,
+                                              compute_original_index=True,
+                                              compute_radius=compute_radius
+                                              )
+        else:
+            print('Skeleton already exists')
+        pass
+
+    def _mind_to_skind_padded(self, minds):
+        minds_b = self.mesh.map_indices_to_unmasked(minds)
+        skinds = self.skeleton.mesh_to_skel_map[minds_b]
+        return self.skeleton.filter_unmasked_indices_padded(skinds)
+
+    def _mind_to_skind(self, minds):
+        mind_padded = self._mind_to_skind_padded(minds)
+        return mind_padded[mind_padded >= 0]
+
+    def _skind_to_mind_mask(self, skinds):
+        skinds_b = self.skeleton.map_indices_to_unmasked(skinds)
+        minds_b_assoc = np.isin(self.skeleton.mesh_to_skel_map, skinds_b)
+        return self.mesh.filter_unmasked_boolean(minds_b_assoc)
+
+    def _skind_to_mind_index(self, skinds):
+        return np.flatnonzero(self._skind_to_mind_mask(skinds))
+
+    def mesh_downstream_of(self, skind, inclusive=True, return_mask=True):
+        ds_skinds = self.skeleton.downstream_nodes(skind, inclusive=inclusive)
+        if return_mask:
+            return self._skind_to_mind_mask(ds_skinds)
+        else:
+            return self._skind_to_mind_index(ds_skinds)
+
+###########################
+    # Visualization functions #
+    ###########################
+
     def mesh_actor(self, **kwargs):
-        return mesh_actor(self.mesh, **kwargs)
+        if self.mesh is not None:
+            return trimesh_vtk.mesh_actor(self.mesh, **kwargs)
 
     def anno_point_actor(self, anno_name, **kwargs):
-        return point_cloud_actor(self.anno[anno_name].points, **kwargs)
+        if anno_name in self.annos:
+            return trimesh_vtk.point_cloud_actor(self.anno[anno_name].points, **kwargs)
+
+    def skeleton_actor(self, **kwargs):
+        if self.skeleton is not None:
+            return trimesh_vtk.skeleton_actor(self.skeleton, **kwargs)

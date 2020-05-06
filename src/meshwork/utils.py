@@ -35,7 +35,7 @@ def _compress_mesh_data(mesh, cname='lz4'):
     zvs = blosc.compress(mesh.vertices.tostring(), typesize=8, cname=cname)
     zfs = blosc.compress(mesh.faces.tostring(), typesize=8, cname=cname)
     zes = blosc.compress(mesh.link_edges.tostring(), typesize=8, cname=cname)
-    znm = blosc.compress(mesh.node_mask.tostring(), typesize=8, cname=cname)
+    znm = blosc.compress(mesh.node_mask.tostring(), typesize=1, cname=cname)
     mesh.voxel_scaling = vxsc
     return zvs, zfs, zes, znm, vxsc
 
@@ -45,7 +45,7 @@ def _decompress_mesh_data(zvs, zfs, zes, znm, vxsc):
     fs = np.frombuffer(blosc.decompress(zfs), dtype=np.int).reshape(-1, 3)
     es = np.frombuffer(blosc.decompress(zes), dtype=np.int).reshape(-1, 2)
     nm = np.frombuffer(blosc.decompress(znm), dtype=np.bool)
-    return Mesh(vs, fs, link_edges=es, node_mask=nm, voxel_scaling=vxsc)
+    return vs, fs, es, nm, vxsc
 
 
 class MaskedMeshMemory(object):
